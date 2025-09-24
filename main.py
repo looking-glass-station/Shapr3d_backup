@@ -1,173 +1,400 @@
+"""
+Export native .shapr packages from both active Projects and TempState workspaces.
+
+Note: This only works for files that you've downloaded to desktop, if you created files on your iPad and haven't
+synced them to your desktop you're out of luck.
+
+- Creates a folder per exported .shapr file
+- Extracts a JPG thumbnail from Shapr3D's resources and saves it alongside
+- Two subdirectories in export dir:
+    - "Current" -> active projects
+    - "Trashed" -> TempState (previously deleted) projects
+- Argparse flags:
+    --export-dir (path)
+    --include-tempstate (bool)
+    --add-revision (bool) - Shapr3D keeps a version history for files, you might want to set this to false if you
+    start running out of space.
+- Skips export if target .shapr already exists. Will take a while to run the first time.
+"""
+
+from __future__ import annotations
+
 import argparse
 import getpass
-import re
-import shutil
+import json
 import sqlite3
-import time
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from fs import mirror
-from typing import Tuple, Optional
+from typing import Iterator, Optional, Sequence, Tuple
+from zipfile import ZipFile, ZIP_DEFLATED
+
+DEFAULT_ADD_REVISION = True
+DEFAULT_INCLUDE_TEMPSTATE = False
 
 
-def backup_files(src: Path, dest: Path) -> None:
+def sanitize(name: str) -> str:
     """
-    Backup files from source to destination.
+    Return a filesystem-safe version of a string by replacing path-breaking characters.
 
     Args:
-        src (Path): The source directory to back up.
-        dest (Path): The destination directory to back up to.
-    """
-    dest.mkdir(parents=True, exist_ok=True)
-    mirror.mirror(str(src), str(dest))
-    #dest.unlink(missing_ok=True)
-    #dest.mkdir(parents=True, exist_ok=True)
-    #shutil.copytree(src, dest, dirs_exist_ok=True)
-    print(f"Backup completed: {src} -> {dest}")
-
-
-def get_project_info(projects_db: Path, project_id: str) -> Tuple[str, Optional[datetime], Optional[str], Optional[str]]:
-    """
-    Retrieve project information from the database.
-
-    Args:
-        projects_db (Path): Path to the projects' database.
-        project_id (str): ID of the project to retrieve information for.
+        name (str): The string to sanitize.
 
     Returns:
-        Tuple[str, Optional[datetime], Optional[str], Optional[str]]: Project information including title, last modified time,
-            light thumbnail, and dark thumbnail.
+        str: A safe string for use as a folder or file name.
     """
-    conn = sqlite3.connect(str(projects_db))
-    cursor = conn.cursor()
-    cursor.execute("SELECT title, lastModifiedAtMsec, thumbnailLight, thumbnailDark FROM Projects WHERE projectID = ?", (project_id,))
-    result = cursor.fetchone()
-    conn.close()
-
-    if result:
-        title, last_modified_time, thumbnail_light, thumbnail_dark = result
-        title = title.strip() if title else project_id
-        mod_date = datetime.utcfromtimestamp(int(last_modified_time) / 1000) if last_modified_time else None
-        return title, mod_date, thumbnail_light, thumbnail_dark
-    else:
-        return project_id, None, None, None
+    return "".join((c if c not in "/\\:" else "_") for c in name)
 
 
-def extract_jpg_image(path: Path, out_path: Path) -> None:
+def ensure_dir(path: Path) -> None:
     """
-    Extract JPG image from a file.
-
-    Thanks, Mr Che Fisher
-    # https://gist.github.com/GrayedFox/8cabb5bc81312cbff0a0a9244683d06c
+    Ensure that a directory exists, creating parents if necessary.
 
     Args:
-        path (Path): Path to the input file.
-        out_path (Path): Path to save the extracted JPG image.
+        path (Path): Directory path to create.
     """
-    jpg_byte_start = b'\xff\xd8'
-    jpg_byte_end = b'\xff\xd9'
-    jpg_image = bytearray()
-
-    with open(path, 'rb') as f:
-        req_data = f.read()
-
-        start = req_data.find(jpg_byte_start)
-        if start == -1:
-            print('Could not find JPG start of image marker!')
-            return
-
-        end = req_data.find(jpg_byte_end, start) + len(jpg_byte_end)
-        jpg_image += req_data[start:end]
-
-    with open(out_path, 'wb') as f:
-        f.write(jpg_image)
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def export_shapes_to_parasolid(backup_path: Path, workspace_path: Path, parasolid_folder: Path) -> Tuple[int, int]:
+def extract_jpg_image(src: Path, dst: Path) -> None:
     """
-    Export shapes to Parasolid format.
+    Extract the first embedded JPEG image from a binary file.
 
     Args:
-        backup_path (Path): Path to the backup directory.
-        workspace_path (Path): Path to the workspace directory.
-        parasolid_folder (Path): Path to the folder to save the exported shapes.
+        src (Path): Source binary file containing embedded JPG data.
+        dst (Path): Destination file path where the extracted JPG will be written.
+    """
+    jpg_start = b"\xff\xd8"
+    jpg_end = b"\xff\xd9"
+    data = src.read_bytes()
+    start = data.find(jpg_start)
+    if start == -1:
+        return
+    end = data.find(jpg_end, start)
+    if end == -1:
+        return
+    end += len(jpg_end)
+    dst.write_bytes(data[start:end])
+
+
+@dataclass
+class ProjectMeta:
+    """
+    Metadata about a Shapr3D project retrieved from the database.
+
+    Attributes:
+        project_id (str): Unique identifier for the project.
+        title (str): Human-readable title of the project.
+        folder (str): Optional folder path associated with the project.
+        revision_id (int): Revision number of the project.
+        thumb_rel (Optional[str]): Relative path to thumbnail image in resources folder.
+    """
+    project_id: str
+    title: str
+    folder: str
+    revision_id: int
+    thumb_rel: Optional[str]
+
+
+def open_db(db_path: Path) -> Optional[sqlite3.Connection]:
+    """
+    Attempt to open a SQLite database.
+
+    Args:
+        db_path (Path): Path to the SQLite database.
 
     Returns:
-        Tuple[int, int]: A tuple containing the count of exported shapes and skipped shapes.
+        sqlite3.Connection | None: Connection object if successful, else None.
     """
-    exported_count = 0
-    skipped_count = 0
-    resources_folder = backup_path / 'LocalState' / 'storage' / 'resources'
-    projects_db = backup_path / 'LocalState' / 'storage' / 'projectStorage.db'
-    illegal_characters_pattern = re.compile(r'[<>:"/\\|?*]')
+    try:
+        return sqlite3.connect(str(db_path))
+    except Exception:
+        return None
 
-    for path in workspace_path.rglob('workspace'):
-        project_id = path.parent.parent.name
-        title, mod_date, thumbnail_light, thumbnail_dark = get_project_info(projects_db, project_id)
-        print(f"Retrieved project info: {title}, {mod_date}")
 
-        out_folder = parasolid_folder / title
-        out_folder.mkdir(parents=True, exist_ok=True)
+def _first_row(cur: sqlite3.Cursor, sql: str, params: Sequence[object]) -> Optional[Tuple]:
+    """
+    Execute a query safely and return the first row.
 
-        if thumbnail_dark:
-            shutil.copy(resources_folder / thumbnail_dark, out_folder / thumbnail_dark)
-            extract_jpg_image(out_folder / thumbnail_dark, out_folder / 'thumbnail.jpg')
+    Args:
+        cur (sqlite3.Cursor): Database cursor.
+        sql (str): SQL query to execute.
+        params (Sequence[object]): Query parameters.
 
-        with sqlite3.connect(path) as conn:
-            cursor = conn.cursor()
-            results = cursor.execute('SELECT cast(ShapeName as text), ShapeData FROM main.Shapes')
+    Returns:
+        tuple | None: First row result or None if no row was returned or query failed.
+    """
+    try:
+        cur.execute(sql, params)
+        return cur.fetchone()
+    except Exception:
+        return None
 
-            for row in results:
-                name, binary = row
-                sanitized_filename = illegal_characters_pattern.sub('_', name)
-                output_file_path = out_folder / f"{sanitized_filename}.x_b"
 
-                if mod_date and (not output_file_path.exists() or output_file_path.stat().st_mtime < mod_date.timestamp()):
-                    shutil.copy(path, out_folder / 'workspace.shapr')
+def read_project_meta(db_path: Path, project_id: str) -> ProjectMeta:
+    """
+    Read metadata for a project from the Shapr3D projectStorage.db.
 
-                    with output_file_path.open('wb') as file:
-                        file.write(binary)
+    Args:
+        db_path (Path): Path to the projectStorage.db SQLite file.
+        project_id (str): Project ID to look up.
 
-                    print(f"    Exported: {sanitized_filename}.x_b")
-                    exported_count += 1
-                else:
-                    print(f"    Skipped: {sanitized_filename}.x_b (File hasn't been modified)")
-                    skipped_count += 1
+    Returns:
+        ProjectMeta: Metadata object containing title, folder, revision, and thumbnail info.
+    """
+    title = project_id
+    folder = ""
+    revision = 0
+    thumb: Optional[str] = None
+    conn = open_db(db_path)
+    if conn is None:
+        return ProjectMeta(project_id, title, folder, revision, thumb)
+    try:
+        cur = conn.cursor()
+        candidates = [
+            ("Projects", "title", "folderPath", "revisionID", "thumbnailLight", "thumbnailDark"),
+            ("projects", "title", "folderpath", "revisionid", "thumbnaillight", "thumbnaildark"),
+        ]
+        row = None
+        for table, c_title, c_folder, c_rev, c_thl, c_thd in candidates:
+            row = _first_row(
+                cur,
+                f"SELECT IFNULL({c_title}, projectID), IFNULL({c_folder}, ''), IFNULL({c_rev}, 0), {c_thl}, {c_thd} "
+                f"FROM {table} WHERE projectID = ?",
+                (project_id,),
+            )
+            if row:
+                break
+        if row:
+            title, folder, revision, th_light, th_dark = row
+            thumb = th_dark or th_light
+            title = (title or project_id).strip() or project_id
+            folder = folder or ""
+            revision = int(revision or 0)
+    finally:
+        conn.close()
+    return ProjectMeta(project_id, title, folder, revision, thumb)
 
-    return exported_count, skipped_count
+
+def make_zip_name(base_dir: Path, title: str, folder: str, revision: int, add_revision: bool) -> Path:
+    """
+    Construct a path for the exported .shapr file.
+
+    Args:
+        base_dir (Path): Root directory for exports.
+        title (str): Project title.
+        folder (str): Folder name associated with the project.
+        revision (int): Project revision ID.
+        add_revision (bool): Whether to append [rev-X] to filename.
+
+    Returns:
+        Path: Full path to the .shapr file.
+    """
+    folder_safe = sanitize(folder).strip(" _")
+    title_safe = sanitize(title) or "untitled"
+    out_dir = base_dir / (folder_safe if folder_safe else title_safe)
+    ensure_dir(out_dir)
+    name = title_safe
+    if add_revision and revision > 0:
+        name += f" [rev-{revision}]"
+    return out_dir / f"{name}.shapr"
+
+
+def build_metadata(project_id: str, revision: int) -> bytes:
+    """
+    Build JSON metadata for embedding inside the .shapr file.
+
+    Args:
+        project_id (str): Project identifier.
+        revision (int): Revision number.
+
+    Returns:
+        bytes: UTF-8 encoded JSON metadata.
+    """
+    obj = {"remoteID": project_id, "revisionID": int(revision or 0), "localChangeCount": 0}
+    return json.dumps(obj, indent=2).encode("utf-8")
+
+
+def write_shapr_zip(target: Path, workspace_path: Path, project_id: str, revision: int) -> None:
+    """
+    Write a .shapr ZIP file containing workspace, metadata, and an empty .export_log.
+
+    Args:
+        target (Path): Output .shapr path.
+        workspace_path (Path): Path to the workspace file to include.
+        project_id (str): Project identifier.
+        revision (int): Revision number for metadata.
+    """
+    with ZipFile(target, mode="w", compression=ZIP_DEFLATED) as zf:
+        zf.writestr(".export_log", b"")
+        zf.writestr(".metadata", build_metadata(project_id, revision))
+        zf.write(workspace_path, arcname="workspace")
+
+
+def save_thumbnail_if_any(root_dir: Path, resources_dir: Path, thumb_rel: Optional[str]) -> None:
+    """
+    Extract and save a thumbnail image if available.
+
+    Args:
+        root_dir (Path): Directory where thumbnail.jpg should be written.
+        resources_dir (Path): Base resources folder containing thumbnails.
+        thumb_rel (str | None): Relative thumbnail path to extract.
+    """
+    if not thumb_rel:
+        return
+    src = resources_dir / thumb_rel
+    if not src.exists():
+        return
+    dst = root_dir / "thumbnail.jpg"
+    try:
+        extract_jpg_image(src, dst)
+    except Exception:
+        pass
+
+
+def iter_active_workspaces(projects_root: Path) -> Iterator[Tuple[str, Path]]:
+    """
+    Yield project IDs and workspace paths for active projects.
+
+    Args:
+        projects_root (Path): Root path to the Shapr3D package.
+
+    Yields:
+        Tuple[str, Path]: (project_id, workspace_path)
+    """
+    for pid_dir in (projects_root / "LocalState" / "projects").iterdir():
+        if not pid_dir.is_dir():
+            continue
+        ws = pid_dir / "project" / "workspace"
+        if ws.exists() and ws.is_file():
+            yield (pid_dir.name, ws)
+
+
+def iter_tempstate_workspaces(tempstate_root: Path) -> Iterator[Tuple[str, Path]]:
+    """
+    Yield GUIDs and workspace paths for TempState projects.
+
+    Args:
+        tempstate_root (Path): Root TempState directory.
+
+    Yields:
+        Tuple[str, Path]: (guid, workspace_path)
+    """
+    for sub in tempstate_root.iterdir():
+        if not sub.is_dir():
+            continue
+        ws = sub / "workspace"
+        if ws.exists() and ws.is_file():
+            yield (sub.name, ws)
+
+
+def export_active_projects(packages_root: Path, base_export_dir: Path, add_revision: bool) -> None:
+    """
+    Export all active projects into subdirectory 'Current'.
+
+    Args:
+        packages_root (Path): Shapr3D package root directory.
+        base_export_dir (Path): Base export directory.
+        add_revision (bool): Whether to append [rev-X] to filenames.
+    """
+    storage_dir = packages_root / "LocalState" / "storage"
+    db_path = storage_dir / "projectStorage.db"
+    resources_dir = storage_dir / "resources"
+    export_dir = base_export_dir / "Current"
+    ensure_dir(export_dir)
+
+    for project_id, ws_path in iter_active_workspaces(packages_root):
+        meta = read_project_meta(db_path, project_id)
+        target = make_zip_name(export_dir, meta.title, meta.folder, meta.revision_id, add_revision)
+        if target.exists():
+            print(f"Skip (exists): {target}")
+            continue
+        print(f"Exporting: {target}")
+        write_shapr_zip(target, ws_path, meta.project_id, meta.revision_id)
+        save_thumbnail_if_any(target.parent, resources_dir, meta.thumb_rel)
+
+
+def export_tempstate_projects(packages_root: Path, base_export_dir: Path, add_revision: bool) -> None:
+    """
+    Export all TempState (trashed) projects into subdirectory 'Trashed'.
+
+    Args:
+        packages_root (Path): Shapr3D package root directory.
+        base_export_dir (Path): Base export directory.
+        add_revision (bool): Whether to append [rev-X] to filenames.
+    """
+    temp_root = packages_root / "TempState"
+    if not temp_root.exists():
+        return
+    export_dir = base_export_dir / "Trashed"
+    ensure_dir(export_dir)
+
+    storage_dir = packages_root / "LocalState" / "storage"
+    db_path = storage_dir / "projectStorage.db"
+    for guid, ws_path in iter_tempstate_workspaces(temp_root):
+        meta = read_project_meta(db_path, guid)
+        title = meta.title if meta.title != guid else f"Temp_{guid}"
+        folder = meta.folder
+        revision = meta.revision_id
+        target = make_zip_name(export_dir, title, folder, revision if add_revision else 0, add_revision)
+        if target.exists():
+            print(f"Skip (exists): {target}")
+            continue
+        print(f"Exporting (TempState): {target}")
+        write_shapr_zip(target, ws_path, guid, revision)
+
+
+def find_packages_root() -> Path:
+    """
+    Locate the Shapr3D package directory for the current user.
+
+    Returns:
+        Path: Path to the first matching Shapr3D package folder found.
+
+    Raises:
+        FileNotFoundError: If no matching package folder is found.
+    """
+    current_user = getpass.getuser()
+    root_folder = Path(fr"C:\Users\{current_user}\AppData\Local\Packages")
+    matches = [p for p in root_folder.rglob("Shapr3D.Shapr3D*") if p.is_dir()]
+    if not matches:
+        raise FileNotFoundError("Shapr3D package folder not found.")
+    return matches[0]
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse CLI arguments.
+
+    Returns:
+        argparse.Namespace: Parsed arguments including export_dir, include_tempstate, add_revision.
+    """
+    p = argparse.ArgumentParser(description="Export Shapr3D .shapr from active and TempState workspaces.")
+    p.add_argument("--export-dir", type=str, required=True, help="Destination directory for exports.")
+    p.add_argument("--include-tempstate", action="store_true", default=DEFAULT_INCLUDE_TEMPSTATE,
+                   help="Include TempState (trashed) projects in the export.")
+    p.add_argument("--add-revision", action="store_true", default=DEFAULT_ADD_REVISION,
+                   help="Append [rev-X] to exported filenames when available.")
+    return p.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Backup and export Shapr3D shapes to Parasolid format.')
-    parser.add_argument('backup_path', type=str, help='Path to the backup destination')
-    args = parser.parse_args()
+    """
+    Main entry point for the script.
 
-    current_user = getpass.getuser()
-    root_folder = Path(fr'C:\Users\{current_user}\AppData\Local\Packages')
-    backup_path = Path(args.backup_path)
-    shapr3d_path = [p for p in root_folder.rglob('Shapr3D.Shapr3D*') if p.is_dir()][0]
+    - Parses CLI arguments.
+    - Finds Shapr3D package root.
+    - Exports current and (optionally) trashed projects.
+    """
+    args = parse_args()
+    export_dir = Path(args.export_dir).expanduser().resolve()
+    ensure_dir(export_dir)
+    packages_root = find_packages_root()
+    export_active_projects(packages_root, export_dir, add_revision=args.add_revision)
 
-    if shapr3d_path.exists():
-        shapr3d_path_backup = backup_path.joinpath('Shapr3d_files')
-        backup_files(shapr3d_path, shapr3d_path_backup)
+    if args.include_tempstate:
+        export_tempstate_projects(packages_root, export_dir, add_revision=args.add_revision)
 
-        # New version change
-        #workspace_directories = shapr3d_path.joinpath('LocalState', 'workspaces')
-        workspace_directories = shapr3d_path
-
-        parasolid_folder = backup_path.joinpath('parasolid_backups')
-
-        exported_count, skipped_count = export_shapes_to_parasolid(shapr3d_path_backup, workspace_directories,
-                                                                   parasolid_folder)
-
-        print("Completed")
-        print(f"Exported: {exported_count}, skipped: {skipped_count}")
-
-        print("Waiting for you to read this.")
-        time.sleep(5)
-        print("...done")
-    else:
-        print("Shapr3D installation not found.")
+    print("Done.")
 
 
 if __name__ == "__main__":
