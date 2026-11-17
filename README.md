@@ -25,4 +25,4 @@ synced them to your desktop you're out of luck.
 
 
 ### Example:
-python main.py C:\My_Backups\Shapr3D
+python main.py --export-dir C:\My_Backups\Shapr3D
